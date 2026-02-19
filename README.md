@@ -17,7 +17,7 @@ ACE2004
 
 CoNLL2003
 
-GENIA
+Genia
 
 BC5CDR
 
