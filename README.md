@@ -5,17 +5,6 @@
 
 本项目基于 Python 3.8 环境运行，所需依赖见 requirements.txt 文件。
 
-### 数据
-
-论文实验涉及的数据集包括：
-
-ACE2004
-
-CoNLL2003
-
-Genia
-
-BC5CDR
 
 ### 训练与评估说明
 
