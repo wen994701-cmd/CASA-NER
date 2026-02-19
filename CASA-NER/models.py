@@ -37,17 +37,189 @@ class ContextAwareEntityEnhancement(nn.Module):
 
 #Complexity-Aware Strategy Selection Generator (CASSG) Module
 class DynamicPromptGenerator(nn.Module):
-    def __init__(self, hidden_size, prompt_length, prompt_number):
+   
+    def __init__(
+        self,
+        hidden_size: int,
+        prompt_length: int,
+        n_prompts=(20, 35, 50),
+        top_c: int = 2,
+        shallow_layers: int = 8,
+        deep_layers: int = 8,
+        dropout: float = 0.1,
+    ):
         super().__init__()
+        self.hidden_size = hidden_size
         self.prompt_length = prompt_length
-        self.prompt_number = prompt_number
-        self.query_embed = nn.Embedding(prompt_number, hidden_size * 2)
+        self.n1, self.n2, self.n3 = n_prompts
+        self.top_c = top_c
+        self.shallow_layers = shallow_layers
+        self.deep_layers = deep_layers
+
+
+        # lexical + syntactic + semantic -> fused feature vector z
+        self.fuse = nn.Sequential(
+            nn.Linear(3, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size),
+        )
+
+
+        self.prompt_bank_1 = nn.Parameter(torch.randn(self.n1, hidden_size * 2) * 0.02)
+        self.prompt_bank_2 = nn.Parameter(torch.randn(self.n2, hidden_size * 2) * 0.02)
+        self.prompt_bank_3 = nn.Parameter(torch.randn(self.n3, hidden_size * 2) * 0.02)
+
+        self.strategy_mod_1 = nn.Linear(hidden_size, hidden_size * 2)
+        self.strategy_mod_2 = nn.Linear(hidden_size, hidden_size * 2)
+        self.strategy_mod_3 = nn.Linear(hidden_size, hidden_size * 2)
+
+        self.strategy_scorer = nn.Linear(hidden_size, 3)
+
+
+        self.activation_scale = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, 1),
+        )
+
+
+        self.position_proj = nn.Linear(hidden_size * 2, hidden_size * 2)
+        self.type_proj = nn.Linear(hidden_size * 2, hidden_size * 2)
+
+        self.dropout = nn.Dropout(dropout)
+
+    @staticmethod
+    def _masked_mean(x: torch.Tensor, mask: torch.Tensor, dim: int):
+        mask_f = mask.float()
+        denom = mask_f.sum(dim=dim, keepdim=True).clamp_min(1.0)
+        return (x * mask_f.unsqueeze(-1)).sum(dim=dim, keepdim=True) / denom.unsqueeze(-1)
+
+    def _complexity_signals(self, hidden_states, attention_mask: torch.Tensor):
+      
+        eps = 1e-6
+        last = hidden_states[-1]  # (B, L, H)
+        mask = attention_mask.bool()
+
+        # Lexical
+        token_var = last.var(dim=-1, unbiased=False)  # (B, L)
+        lexical = (token_var * mask.float()).sum(dim=1) / mask.float().sum(dim=1).clamp_min(1.0)  # (B,)
+
+        # Syntactic
+        n_layers = len(hidden_states)
+        shallow_n = min(self.shallow_layers, n_layers)
+        deep_n = min(self.deep_layers, n_layers)
+
+        shallow_stack = torch.stack(hidden_states[:shallow_n], dim=0).mean(dim=0)  # (B, L, H)
+        deep_stack = torch.stack(hidden_states[-deep_n:], dim=0).mean(dim=0)       # (B, L, H)
+
+        shallow_sent = self._masked_mean(shallow_stack, mask, dim=1).squeeze(1)  # (B, H)
+        deep_sent = self._masked_mean(deep_stack, mask, dim=1).squeeze(1)        # (B, H)
+
+        syn_cos = F.cosine_similarity(shallow_sent, deep_sent, dim=-1).clamp(-1+eps, 1-eps)
+        syntactic = 1.0 - syn_cos
+
+        # Semantic
+        x1 = last[:, :-1, :]
+        x2 = last[:, 1:, :]
+        m_pair = mask[:, :-1] & mask[:, 1:]
+        pair_cos = F.cosine_similarity(x1, x2, dim=-1)  # (B, L-1)
+        semantic = 1.0 - ((pair_cos * m_pair.float()).sum(dim=1) / m_pair.float().sum(dim=1).clamp_min(1.0))
+
+        return torch.stack([lexical, syntactic, semantic], dim=-1)  # (B, 3)
+
+    def _build_candidates(self, z: torch.Tensor):
+        B = z.size(0)
+        d1 = self.strategy_mod_1(z).unsqueeze(1)
+        d2 = self.strategy_mod_2(z).unsqueeze(1)
+        d3 = self.strategy_mod_3(z).unsqueeze(1)
+
+        p1 = self.prompt_bank_1.unsqueeze(0).expand(B, -1, -1) + d1
+        p2 = self.prompt_bank_2.unsqueeze(0).expand(B, -1, -1) + d2
+        p3 = self.prompt_bank_3.unsqueeze(0).expand(B, -1, -1) + d3
+        return self.dropout(p1), self.dropout(p2), self.dropout(p3)
+
+    def _select_and_merge(self, candidates, weights: torch.Tensor):
+        p1, p2, p3 = candidates
+        B = weights.size(0)
+
+        topv, topi = torch.topk(weights, k=min(self.top_c, 3), dim=-1)  # (B, C)
+        pools = []
+        sizes = []
+        for b in range(B):
+            parts = []
+            for r in range(topi.size(1)):
+                sid = int(topi[b, r].item())
+                w = topv[b, r].item()
+                if sid == 0:
+                    parts.append(p1[b] * w)
+                elif sid == 1:
+                    parts.append(p2[b] * w)
+                else:
+                    parts.append(p3[b] * w)
+            pool = torch.cat(parts, dim=0)
+            pools.append(pool)
+            sizes.append(pool.size(0))
+
+        max_pool = max(sizes)
+        pool_tensor = p1.new_zeros((B, max_pool, p1.size(-1)))
+        pool_mask = torch.zeros((B, max_pool), dtype=torch.bool, device=p1.device)
+        for b, pool in enumerate(pools):
+            n = pool.size(0)
+            pool_tensor[b, :n] = pool
+            pool_mask[b, :n] = True
+        return pool_tensor, pool_mask
+
+    def _activate_prompts(self, pool: torch.Tensor, pool_mask: torch.Tensor, z: torch.Tensor, text_repr: torch.Tensor):
+        """
+        Adaptive prompt activation (Eq.9-11).
+        Outputs variable-length prompts per batch; downstream can pad/truncate as needed.
+        """
+        B, Npool, D = pool.shape
+        H = self.hidden_size
+
+        scale = torch.sigmoid(self.activation_scale(z)).squeeze(-1)  # (B,)
+        expected = scale * (self.n1 + self.n2 + self.n3) / 3.0
+        n_active = expected.round().long().clamp(min=1, max=Npool)
+
+        prompt_repr = pool[:, :, :H]
+        scores = torch.einsum("bnh,bh->bn", prompt_repr, text_repr)
+        scores[~pool_mask] = -1e9
+
+        max_k = int(n_active.max().item())
+        out = pool.new_zeros((B, max_k, D))
+        out_mask = torch.zeros((B, max_k), dtype=torch.bool, device=pool.device)
+
+        for b in range(B):
+            k = int(n_active[b].item())
+            idx = torch.topk(scores[b], k=min(k, scores.size(1)), dim=-1).indices
+            sel = pool[b, idx]
+            out[b, :k] = sel[:k]
+            out_mask[b, :k] = True
+
+        return out, out_mask
+
+    def forward(self, hidden_states, attention_mask: torch.Tensor):
+        signals = self._complexity_signals(hidden_states, attention_mask)
+        z = self.fuse(signals)
+
+        last = hidden_states[-1]
+        text_repr = self._masked_mean(last, attention_mask.bool(), dim=1).squeeze(1)
+
+        candidates = self._build_candidates(z)
+        weights = F.softmax(self.strategy_scorer(z), dim=-1)
+
+        pool, pool_mask = self._select_and_merge(candidates, weights)
+        prompts, prompt_mask = self._activate_prompts(pool, pool_mask, z, text_repr)
+
+        position_queries = self.position_proj(prompts)
+        type_queries = self.type_proj(prompts)
+        return position_queries, type_queries, prompt_mask
 
     def generate_dynamic_prompts(self, context_embeddings, context_masks):
-        # Assume that context_embeddings is of shape (batch_size, seq_len, hidden_size)
+     
         batch_size = context_embeddings.shape[0]
-        # Create a dummy example ofComplexity-Aware Strategy Selection Generator based on context
-        # A more sophisticated mechanism can be added based on task-specific needs
+   
         dynamic_prompts = self.query_embed.weight.unsqueeze(0).expand(batch_size, -1, -1)
         return dynamic_prompts
 
@@ -283,10 +455,11 @@ class promptner(PreTrainedModel):
 
         
         # AddComplexity-Aware Strategy Selection Generator (CASSG) Module
-        self.dynamic_prompt_generator = DynamicPromptGenerator(config.hidden_size, prompt_length, prompt_number)
+        self.dynamic_prompt_generator = DynamicPromptGenerator(config.hidden_size, prompt_length,
+            n_prompts=(20, 35, 50), top_c=2, dropout=0.1)
 
-        #初始化moh
-        self.moh_attention = Semantic Modulation Attention(
+        #初始化
+        self.SMAM_attention = Semantic Modulation Attention(
             dim=config.hidden_size,  # 对应嵌入维度
             num_heads=8,            # 设置多头数量（可调整）
             qkv_bias=True,          # 是否添加偏置
@@ -413,35 +586,49 @@ class promptner(PreTrainedModel):
         # last_hidden_state, pooler_output, hidden_states 
         
         
-        # Generate dynamic prompts
-        dynamic_prompts = self.dynamic_prompt_generator(outputs.last_hidden_state, context_masks)
-        
+        # Generate dynamic prompts (CASSG): position / type queries for decoding
+        position_queries, type_queries, prompt_mask = self.dynamic_prompt_generator(outputs.hidden_states, raw_context_masks)
 
-        masked_seq_logits = None
-        if self.use_masked_lm and self.training:
-            if self.model_type == "bert":
-                masked_seq_logits = self.cls(outputs.last_hidden_state)
-            if self.model_type == "roberta":
-                masked_seq_logits = self.lm_head(outputs.last_hidden_state)
+      
+        pos_q, tgt_q = torch.split(position_queries, outputs.last_hidden_state.size(2), dim=-1)
+        pos_t, tgt_t = torch.split(type_queries, outputs.last_hidden_state.size(2), dim=-1)
 
-        if self.withimage:
-            image_h = self.clip_v(**image_inputs)
-            image_last_hidden_state = image_h.last_hidden_state
-            aligned_image_h = self.vision2text(image_last_hidden_state)
-        
-        query_embed = self.query_embed.weight # [100, 768 * 2]
-        query_embeds = torch.split(query_embed, outputs.last_hidden_state.size(2), dim=-1)
-        
+        # Pad/Truncate to fixed prompt_number required by decoder implementation
+        K = self.prompt_number  # fixed length used by decoders
 
-        if tgt is None:
-            tgt = query_embeds[1]
-            tgt = tgt.unsqueeze(0).expand(batch_size, -1, -1) # [2, 100, 768]
+        def _pad_to_k(x, k):
+            n = x.size(1)
+            if n == k:
+                return x
+            if n > k:
+                return x[:, :k, :]
+            pad = x.new_zeros((x.size(0), k - n, x.size(2)))
+            return torch.cat([x, pad], dim=1)
 
-        if pos is None:
-            pos = query_embeds[0]
-            pos = pos.unsqueeze(0).expand(batch_size, -1, -1) # [2, 100, 768]
+        def _pad_mask(m, k):
+            n = m.size(1)
+            if n == k:
+                return m
+            if n > k:
+                return m[:, :k]
+            pad = torch.zeros((m.size(0), k - n), dtype=torch.bool, device=m.device)
+            return torch.cat([m, pad], dim=1)
+
+        pos_q = _pad_to_k(pos_q, K)
+        tgt_q = _pad_to_k(tgt_q, K)
+        pos_t = _pad_to_k(pos_t, K)
+        tgt_t = _pad_to_k(tgt_t, K)
+        prompt_mask = _pad_mask(prompt_mask, K)
+
+
+        tgt = tgt_q
+        pos = pos_q
+        tgt2 = tgt_t
+        pos2 = pos_t
 
         orig_tgt = tgt
+        orig_tgt2 = tgt2
+
         intermediate = []
         for i in range(self.loss_layers, 0, -1):
 
@@ -449,8 +636,8 @@ class promptner(PreTrainedModel):
             h_token = util.combine(h, context2token_masks, self.pool_type)
 
             
-            # # # 应用 Semantic Modulation Attention 层
-            h_token = self.moh_attention(h_token)
+
+            h_token = self.SMAM_attention(h_token)
     
             
 
@@ -463,7 +650,7 @@ class promptner(PreTrainedModel):
                 
                 tgt = util.batch_index(outputs.hidden_states[-i], inx4locator) + orig_tgt
                 if self.prompt_length > 1:
-                    tgt2 = util.batch_index(outputs.hidden_states[-i], inx4locator + self.prompt_length-1) + orig_tgt
+                    tgt2 = util.batch_index(outputs.hidden_states[-i], inx4locator + self.prompt_length-1) + orig_tgt2
 
             updated_tgt = tgt
 
@@ -478,7 +665,7 @@ class promptner(PreTrainedModel):
                 updated_tgt = self.decoder(tgt, pos, h_token, mask=token_masks)
     
                 if self.prompt_length > 1:
-                    updated_tgt2 = self.decoder2(tgt2, pos, h_token, mask=token_masks)
+                    updated_tgt2 = self.decoder2(tgt2, pos2, h_token, mask=token_masks)
                 else:
                     updated_tgt2 = updated_tgt
                     
