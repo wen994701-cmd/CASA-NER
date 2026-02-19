@@ -1,9 +1,5 @@
 # CASA-NER
 
-<p float="left">
-  <img src="./assets/comparison.png" width="28.7%" />
-  <img src="./assets/overview.png" width="69%" />
-</p>
 
 ## 设置
 
