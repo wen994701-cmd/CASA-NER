@@ -7,7 +7,7 @@ from CASA-NER.modeling_bert import BertConfig, BertModel
 #from CASA-NER.modeling_roberta import RobertaConfig, RobertaModel, RobertaLMHead
 #from CASA-NER.modeling_xlm_roberta import XLMRobertaConfig
 from transformers.modeling_utils import PreTrainedModel
-from CASA-NER.Semantic Modulation Attention import Semantic Modulation Attention
+from CASA-NER.SMAM import Semantic Modulation Attention
 from CASA-NER import util
 import logging
 
